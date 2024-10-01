@@ -6,6 +6,7 @@ import zipfile
 import boto3
 from botocore.exceptions import NoCredentialsError
 from dotenv import load_dotenv
+from io import BytesIO
 
 # Carrega as variáveis de ambiente do .env
 load_dotenv()
@@ -15,26 +16,32 @@ def process_media(file):
     probe = ffmpeg.probe(file)
     return probe
 
-# Função para gerar thumbnails a cada minuto
-def generate_thumbnails(media_file, duration):
-    thumbnails_dir = "thumbnails"
-    os.makedirs(thumbnails_dir, exist_ok=True)
-    
+# Função para gerar thumbnails a cada minuto e salvar diretamente no S3
+def generate_thumbnails(media_file, duration, bucket):
+    s3 = boto3.client('s3',
+                      aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                      aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+                      region_name=os.getenv('AWS_REGION'))
+
     thumbnail_paths = []
     for i in range(0, int(duration), 60):
-        thumbnail_path = os.path.join(thumbnails_dir, f"thumbnail_{i}.png")
+        thumbnail_buffer = BytesIO()
         (
             ffmpeg
             .input(media_file, ss=i)
-            .output(thumbnail_path, vframes=1)
-            .run(overwrite_output=True)
+            .output('pipe:', vframes=1, format='png')
+            .run(overwrite_output=True, capture_stdout=thumbnail_buffer)
         )
+        
+        thumbnail_buffer.seek(0)
+        thumbnail_path = f"thumbnails/thumbnail_{i}.png"
+        s3.upload_fileobj(thumbnail_buffer, bucket, thumbnail_path)
         thumbnail_paths.append(thumbnail_path)
     
     return thumbnail_paths
 
-# Função para gerar o XML ADI 1.1 com base nos campos e dados extraídos
-def generate_adi_xml(fields, media_data):
+# Função para gerar o XML ADI 1.1 com base nos campos e dados extraídos e salvar no S3
+def generate_adi_xml(fields, media_data, bucket):
     adi = ET.Element('ADI', version='1.1')
     asset = ET.SubElement(adi, 'Asset', Asset_Class='title')
     
@@ -55,47 +62,61 @@ def generate_adi_xml(fields, media_data):
     for stream in media_data.get('streams', []):
         stream_type = stream.get('codec_type', 'unknown')
         ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Codec', Value=stream.get('codec_name', ''))
-        ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Width', Value=str(stream.get('width', '')) if stream_type == 'video' else '')
-        ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Height', Value=str(stream.get('height', '')) if stream_type == 'video' else '')
-        ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Channels', Value=str(stream.get('channels', '')) if stream_type == 'audio' else '')
+        if stream_type == 'video':
+            ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Width', Value=str(stream.get('width', '')))
+            ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Height', Value=str(stream.get('height', '')))
+        elif stream_type == 'audio':
+            ET.SubElement(title, 'App_Data', Name=f'{stream_type}_Channels', Value=str(stream.get('channels', '')))
     
-    tree = ET.ElementTree(adi)
-    return ET.tostring(adi, encoding='utf8', method='xml').decode()
+    # Converter o XML para string e enviar para o S3
+    adi_xml_str = ET.tostring(adi, encoding='utf8', method='xml').decode()
+    adi_buffer = BytesIO(adi_xml_str.encode('utf-8'))
+    
+    s3 = boto3.client('s3',
+                      aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                      aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+                      region_name=os.getenv('AWS_REGION'))
+    
+    adi_xml_path = "adi/adi.xml"
+    s3.upload_fileobj(adi_buffer, bucket, adi_xml_path)
 
-# Função para zipar os arquivos enviados
-def zip_files(adi_xml, media_file, thumbnail_files):
-    zip_filename = "output.zip"
-    with zipfile.ZipFile(zip_filename, "w") as zipf:
+    return adi_xml_path
+
+# Função para zipar os arquivos diretamente no S3
+def zip_files(adi_xml, media_file, thumbnail_files, bucket):
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w") as zipf:
+        # Adiciona o XML ADI no zip
+        s3 = boto3.client('s3',
+                          aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                          aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+                          region_name=os.getenv('AWS_REGION'))
+
         zipf.writestr("adi.xml", adi_xml)
-        zipf.write(media_file, os.path.basename(media_file))
+
+        # Adiciona o arquivo de mídia
+        media_file.seek(0)
+        zipf.writestr(os.path.basename(media_file.name), media_file.read())
+        
+        # Adiciona thumbnails
         for thumbnail in thumbnail_files:
-            zipf.write(thumbnail, os.path.basename(thumbnail))
+            thumbnail_buffer = BytesIO()
+            s3.download_fileobj(bucket, thumbnail, thumbnail_buffer)
+            thumbnail_buffer.seek(0)
+            zipf.writestr(os.path.basename(thumbnail), thumbnail_buffer.read())
+
+    # Upload do arquivo zip para o S3
+    zip_buffer.seek(0)
+    zip_filename = "output.zip"
+    s3.upload_fileobj(zip_buffer, bucket, zip_filename)
+
     return zip_filename
 
 # Função para enviar o arquivo para o S3
-def upload_to_s3(file_name):
-    # Carrega as variáveis de ambiente
-    bucket = os.getenv('AWS_S3_BUCKET_NAME')
-    aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
-    aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+def upload_to_s3(file_name, bucket):
     region = os.getenv('AWS_REGION')
-
-    # Cria o cliente S3 com as credenciais do .env
-    s3 = boto3.client('s3',
-                      aws_access_key_id=aws_access_key,
-                      aws_secret_access_key=aws_secret_key,
-                      region_name=region)
-
-    object_name = file_name
-    try:
-        s3.upload_file(file_name, bucket, object_name)
-        return f"https://{bucket}.s3.{region}.amazonaws.com/{object_name}"
-    except FileNotFoundError:
-        st.error("O arquivo não foi encontrado.")
-        return None
-    except NoCredentialsError:
-        st.error("Credenciais AWS não encontradas.")
-        return None
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{file_name}"
 
 # Interface do Streamlit
 st.title("Automatização de vídeos")
@@ -111,34 +132,27 @@ fields['Summary_Long'] = st.text_area("Resumo Longo", "(ex: Resumo longo do epis
 media_file = st.file_uploader("Escolha o arquivo de mídia", type=["mp4", "mkv", "avi"])
 
 if media_file:
-    # Salvando o arquivo localmente
-    media_path = os.path.join("temp", media_file.name)
+    bucket = os.getenv('AWS_S3_BUCKET_NAME')
     
-    with open(media_path, "wb") as f:
-        f.write(media_file.getbuffer())
-
-    st.success("Arquivo carregado com sucesso!")
-
     # Processar mídia com ffmpeg
-    media_data = process_media(media_path)
+    media_data = process_media(media_file)
     st.json(media_data)
 
     # Extrair a duração do vídeo
     duration = float(media_data['format']['duration'])
 
-    # Gerar thumbnails a cada 1 minuto
-    thumbnail_files = generate_thumbnails(media_path, duration)
+    # Gerar thumbnails a cada 1 minuto e salvar diretamente no S3
+    thumbnail_files = generate_thumbnails(media_file.name, duration, bucket)
+    st.success(f"Thumbnails gerados e enviados para o S3: {len(thumbnail_files)}")
 
-    st.success(f"Thumbnails gerados: {len(thumbnail_files)}")
-
-    # Gerar o XML ADI 1.1
-    adi_xml = generate_adi_xml(fields, media_data)
+    # Gerar o XML ADI 1.1 e salvar no S3
+    adi_xml = generate_adi_xml(fields, media_data, bucket)
     st.text_area("ADI XML", adi_xml)
 
-    # Zipa os arquivos (media, thumbnails e ADI XML)
-    zip_filename = zip_files(adi_xml, media_path, thumbnail_files)
+    # Zipa os arquivos e envia diretamente para o S3
+    zip_filename = zip_files(adi_xml, media_file, thumbnail_files, bucket)
 
     # Upload automático do arquivo zip para o S3
-    s3_url = upload_to_s3(zip_filename)
+    s3_url = upload_to_s3(zip_filename, bucket)
     if s3_url:
         st.success(f"Arquivo enviado para o S3! [Baixar ZIP]({s3_url})")
